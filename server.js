@@ -1,10 +1,12 @@
 /* ════════════════════════════════════════════════════════════════
    NERDNIA voice switchboard — Phase 2, Option B (cloud-hosted)
    ----------------------------------------------------------------
-   Relays WebRTC signaling (SDP/ICE) ONLY. Player audio is peer-to-peer
-   and never passes through this server, so it adds ~0 audio latency.
-   This same process also serves the player join page (public/join.html)
-   over the platform's HTTPS, which is required for getUserMedia.
+   Relays tiny "mouth level" numbers from each player to the GM dashboard.
+   Each player's browser analyses its OWN mic locally (spectral flux) and
+   sends just a number over this WebSocket; NO audio and NO WebRTC pass
+   through here, so it adds ~0 latency and needs no STUN/TURN. This same
+   process also serves the player join page (public/join.html) over the
+   platform's HTTPS, which is required for getUserMedia.
 
    Roles per room: one HOST (the GM dashboard) + up to 3 PLAYERS.
    Single global room (one show). Add rooms later if ever needed.
@@ -77,15 +79,14 @@ wss.on('connection', (ws) => {
             return;
         }
 
-        /* player -> host signal (offer / ICE) */
-        if (msg.type === 'signal' && ws.role === 'player') {
-            send(host, { type: 'signal', from: ws.connId, data: msg.data });
+        /* player -> host mouth level (the pivot: local analysis, just a number) */
+        if (msg.type === 'mouth' && ws.role === 'player') {
+            send(host, { type: 'mouth', from: ws.connId, level: msg.level });
             return;
         }
 
-        /* host -> player signal (answer / ICE) and kick */
+        /* host -> player control (kick) */
         if (ws.role === 'host') {
-            if (msg.type === 'signal') { send(players.get(msg.to), { type: 'signal', data: msg.data }); return; }
             if (msg.type === 'kick') {
                 const pws = players.get(msg.connId);
                 if (pws) { send(pws, { type: 'kicked' }); pws.close(); }
