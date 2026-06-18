@@ -45,18 +45,11 @@
   /* The join page is served by the switchboard itself, so the signaling
      socket lives on the same host — no URL to hardcode or configure. */
   var WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
-  var ICE = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    /* §7-C TURN relay — bounces audio when a direct link isn't possible
-       (different networks / strict NAT / firewalls). Open Relay by Metered;
-       creds are public by design. TEST relay — swap for a dedicated one for the show. */
-    { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
-  ];
 
-  var ws = null, pc = null, micStream = null, connId = null, joined = false;
-  var pendingIce = [];   /* ICE candidates queued until the remote answer is set */
+  var ws = null, micStream = null, connId = null, joined = false;
+  /* Local mic analysis — the pivot: we compute a "mouth level" here and send
+     just that number over the WebSocket. No WebRTC, no audio leaves the device. */
+  var audioCtx = null, analyser = null, data = null, prevBins = null, rafId = null, lastSent = 0;
   var nameEl   = document.getElementById('name'),
       joinBtn  = document.getElementById('joinBtn'),
       setupEl  = document.getElementById('setup'),
@@ -104,52 +97,58 @@
     };
   }
 
-  async function onMessage(m) {
-    if (m.type === 'welcome') { connId = m.connId; await startPeer(); return; }
-    if (m.type === 'signal')  { await onSignal(m.data); return; }
+  function onMessage(m) {
+    if (m.type === 'welcome') { connId = m.connId; startMeter(); return; }
     if (m.type === 'kicked')  { leave('Removed by the GM.'); return; }
   }
 
-  async function startPeer() {
-    if (pc) { try { pc.close(); } catch (e) {} }
-    pendingIce = [];
-    pc = new RTCPeerConnection({ iceServers: ICE });
-    micStream.getTracks().forEach(function (t) { pc.addTrack(t, micStream); });
-    pc.createDataChannel('ctrl');   /* reserved for self-mute / push-to-talk status (later pass) */
-    pc.onicecandidate = function (e) { if (e.candidate) send({ type: 'signal', data: { ice: e.candidate } }); };
-    pc.onconnectionstatechange = function () {
-      var s = pc.connectionState;
-      if (s === 'connected')         setStatus('connected', 'Live — your voice is driving your character.');
-      else if (s === 'failed')       setStatus('error', 'Connection failed. Reloading may help.');
-      else if (s === 'disconnected') setStatus('connecting', 'Reconnecting…');
-    };
-    var offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    send({ type: 'signal', data: { sdp: pc.localDescription } });
+  /* Build the local analyser once and start the RAF loop that computes spectral
+     flux (the SAME math the dashboard uses) and sends a throttled "mouth level".
+     The dashboard does all smoothing/sensitivity/flap, so we send the raw
+     per-frame flux — one small number, ~25x/sec. */
+  function startMeter() {
+    setStatus('connected', 'Live — your voice is driving your character.');
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      if (!analyser) {
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;                 /* mirror the dashboard analyser */
+        analyser.smoothingTimeConstant = 0.0;   /* raw frame diffs for spectral flux */
+        audioCtx.createMediaStreamSource(micStream).connect(analyser);
+        data = new Uint8Array(analyser.frequencyBinCount);
+      }
+    } catch (e) { setStatus('error', 'Audio analysis failed. Reloading may help.'); return; }
+    prevBins = null;
+    lastSent = 0;
+    if (rafId) cancelAnimationFrame(rafId);
+    tick();
   }
 
-  async function onSignal(data) {
-    if (!pc) return;
-    try {
-      if (data.sdp) {
-        await pc.setRemoteDescription(data.sdp);
-        /* answer is set — flush ICE candidates that arrived before it (adding
-           a candidate before the description exists throws and loses it). */
-        for (var i = 0; i < pendingIce.length; i++) { try { await pc.addIceCandidate(pendingIce[i]); } catch (e) {} }
-        pendingIce = [];
-      } else if (data.ice) {
-        if (pc.remoteDescription && pc.remoteDescription.type) { try { await pc.addIceCandidate(data.ice); } catch (e) {} }
-        else { pendingIce.push(data.ice); }
-      }
-    } catch (e) { /* ignore malformed signaling */ }
+  function tick() {
+    rafId = requestAnimationFrame(tick);
+    if (!analyser || !joined) return;
+    analyser.getByteFrequencyData(data);
+    var flux = 0;
+    if (prevBins) {
+      for (var i = 0; i < data.length; i++) { var d = data[i] - prevBins[i]; if (d > 0) flux += d; }
+      flux = flux / data.length;
+    } else {
+      prevBins = new Uint8Array(data.length);
+    }
+    prevBins.set(data);
+    /* Throttle to ~25/sec — plenty for discrete mouth flap frames, tiny bandwidth. */
+    var now = performance.now();
+    if (now - lastSent >= 40) { lastSent = now; send({ type: 'mouth', level: Math.round(flux * 10) / 10 }); }
   }
 
   function leave(msg) {
     joined = false;
-    try { if (pc) pc.close(); } catch (e) {}
+    try { if (rafId) cancelAnimationFrame(rafId); } catch (e) {}
+    try { if (audioCtx) audioCtx.close(); } catch (e) {}
     try { if (ws) ws.close(); } catch (e) {}
     try { if (micStream) micStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-    pc = null; ws = null; micStream = null;
+    rafId = null; audioCtx = null; analyser = null; ws = null; micStream = null;
     setStatus('kicked', msg || 'Disconnected.');
     meEl.style.display = 'none';
   }
