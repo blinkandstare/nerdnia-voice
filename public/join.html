@@ -38,6 +38,13 @@
       <button id="joinBtn">Allow microphone &amp; join</button>
     </div>
     <div class="me" id="me">Joined as <b id="meName"></b></div>
+    <div id="lvlWrap" style="display:none; margin-top:14px;">
+      <div style="font-size:11px; text-transform:uppercase; letter-spacing:.1em; color:#8b90a0; margin-bottom:6px;">Your voice level (test)</div>
+      <div style="height:12px; background:#0e0f13; border:1px solid #2c313f; border-radius:6px; overflow:hidden;">
+        <div id="lvlFill" style="height:100%; width:0%; background:#39d98a;"></div>
+      </div>
+      <div id="lvlNum" style="font-size:11px; color:#8b90a0; margin-top:5px;">Talk — this should move.</div>
+    </div>
     <div class="status"><span class="dot" id="dot"></span><span id="statusTxt">Not connected.</span></div>
   </div>
 <script>
@@ -55,6 +62,9 @@
       setupEl  = document.getElementById('setup'),
       meEl     = document.getElementById('me'),
       meName   = document.getElementById('meName'),
+      lvlWrap  = document.getElementById('lvlWrap'),
+      lvlFill  = document.getElementById('lvlFill'),
+      lvlNum   = document.getElementById('lvlNum'),
       dot      = document.getElementById('dot'),
       statusTxt= document.getElementById('statusTxt');
 
@@ -69,6 +79,14 @@
     var name = (nameEl.value || '').trim();
     if (!name) { nameEl.focus(); return; }
     joinBtn.disabled = true;
+    /* Create + resume the AudioContext SYNCHRONOUSLY here, inside the button
+       tap. iOS Safari only honours resume() from a real user gesture; if we
+       wait and do it later (in the socket callback) the context stays
+       suspended and the analyser reads pure silence → level always 0. */
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCtx.resume();
+    } catch (e) {}
     setStatus('connecting', 'Requesting microphone…');
     try {
       micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -78,8 +96,18 @@
       return;
     }
     joined = true;
+    /* Build the analyser graph now that we have the mic. The context is already
+       resumed (above), so it reads live audio. */
+    try {
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;                 /* mirror the dashboard analyser */
+      analyser.smoothingTimeConstant = 0.0;   /* raw frame diffs for spectral flux */
+      audioCtx.createMediaStreamSource(micStream).connect(analyser);
+      data = new Uint8Array(analyser.frequencyBinCount);
+    } catch (e) { setStatus('error', 'Audio analysis failed. Reloading may help.'); joinBtn.disabled = false; return; }
     setupEl.style.display = 'none';
     meEl.style.display = 'block';
+    lvlWrap.style.display = 'block';
     meName.textContent = name;
     setStatus('connecting', 'Connecting…');
     openSocket(name);
@@ -102,23 +130,14 @@
     if (m.type === 'kicked')  { leave('Removed by the GM.'); return; }
   }
 
-  /* Build the local analyser once and start the RAF loop that computes spectral
+  /* Start (or restart, after a reconnect) the RAF loop that computes spectral
      flux (the SAME math the dashboard uses) and sends a throttled "mouth level".
+     The analyser graph itself is built in join() so it's tied to the user gesture.
      The dashboard does all smoothing/sensitivity/flap, so we send the raw
      per-frame flux — one small number, ~25x/sec. */
   function startMeter() {
     setStatus('connected', 'Live — your voice is driving your character.');
-    try {
-      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === 'suspended') audioCtx.resume();
-      if (!analyser) {
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 256;                 /* mirror the dashboard analyser */
-        analyser.smoothingTimeConstant = 0.0;   /* raw frame diffs for spectral flux */
-        audioCtx.createMediaStreamSource(micStream).connect(analyser);
-        data = new Uint8Array(analyser.frequencyBinCount);
-      }
-    } catch (e) { setStatus('error', 'Audio analysis failed. Reloading may help.'); return; }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
     prevBins = null;
     lastSent = 0;
     if (rafId) cancelAnimationFrame(rafId);
@@ -137,6 +156,10 @@
       prevBins = new Uint8Array(data.length);
     }
     prevBins.set(data);
+    /* On-phone test readout — proves THIS device is hearing you, independent of
+       the dashboard. Updated every frame so it's smooth (sensitivity 7 = full bar). */
+    if (lvlFill) lvlFill.style.width = Math.min(100, (flux / 7) * 100) + '%';
+    if (lvlNum)  lvlNum.textContent  = 'level: ' + (Math.round(flux * 10) / 10);
     /* Throttle to ~25/sec — plenty for discrete mouth flap frames, tiny bandwidth. */
     var now = performance.now();
     if (now - lastSent >= 40) { lastSent = now; send({ type: 'mouth', level: Math.round(flux * 10) / 10 }); }
@@ -151,6 +174,7 @@
     rafId = null; audioCtx = null; analyser = null; ws = null; micStream = null;
     setStatus('kicked', msg || 'Disconnected.');
     meEl.style.display = 'none';
+    lvlWrap.style.display = 'none';
   }
 })();
 </script>
