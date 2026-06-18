@@ -48,6 +48,7 @@
   var ICE = [{ urls: 'stun:stun.l.google.com:19302' }];  /* TURN added later if a strict-NAT player can't connect (§7-C) */
 
   var ws = null, pc = null, micStream = null, connId = null, joined = false;
+  var pendingIce = [];   /* ICE candidates queued until the remote answer is set */
   var nameEl   = document.getElementById('name'),
       joinBtn  = document.getElementById('joinBtn'),
       setupEl  = document.getElementById('setup'),
@@ -103,6 +104,7 @@
 
   async function startPeer() {
     if (pc) { try { pc.close(); } catch (e) {} }
+    pendingIce = [];
     pc = new RTCPeerConnection({ iceServers: ICE });
     micStream.getTracks().forEach(function (t) { pc.addTrack(t, micStream); });
     pc.createDataChannel('ctrl');   /* reserved for self-mute / push-to-talk status (later pass) */
@@ -121,8 +123,16 @@
   async function onSignal(data) {
     if (!pc) return;
     try {
-      if (data.sdp)      { await pc.setRemoteDescription(data.sdp); }
-      else if (data.ice) { try { await pc.addIceCandidate(data.ice); } catch (e) {} }
+      if (data.sdp) {
+        await pc.setRemoteDescription(data.sdp);
+        /* answer is set — flush ICE candidates that arrived before it (adding
+           a candidate before the description exists throws and loses it). */
+        for (var i = 0; i < pendingIce.length; i++) { try { await pc.addIceCandidate(pendingIce[i]); } catch (e) {} }
+        pendingIce = [];
+      } else if (data.ice) {
+        if (pc.remoteDescription && pc.remoteDescription.type) { try { await pc.addIceCandidate(data.ice); } catch (e) {} }
+        else { pendingIce.push(data.ice); }
+      }
     } catch (e) { /* ignore malformed signaling */ }
   }
 
