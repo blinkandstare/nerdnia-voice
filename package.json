@@ -1,0 +1,16 @@
+{
+  "name": "nerdnia-voice-switchboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Signaling switchboard + player join page for NERDNIA per-voice lip-sync (Phase 2, Option B).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
