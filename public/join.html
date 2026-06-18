@@ -45,7 +45,15 @@
   /* The join page is served by the switchboard itself, so the signaling
      socket lives on the same host — no URL to hardcode or configure. */
   var WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
-  var ICE = [{ urls: 'stun:stun.l.google.com:19302' }];  /* TURN added later if a strict-NAT player can't connect (§7-C) */
+  var ICE = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    /* §7-C TURN relay — bounces audio when a direct link isn't possible
+       (different networks / strict NAT / firewalls). Open Relay by Metered;
+       creds are public by design. TEST relay — swap for a dedicated one for the show. */
+    { urls: 'turn:openrelay.metered.ca:80',  username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+  ];
 
   var ws = null, pc = null, micStream = null, connId = null, joined = false;
   var pendingIce = [];   /* ICE candidates queued until the remote answer is set */
