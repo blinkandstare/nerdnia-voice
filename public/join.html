@@ -56,7 +56,14 @@
   var ws = null, micStream = null, connId = null, joined = false;
   /* Local mic analysis — the pivot: we compute a "mouth level" here and send
      just that number over the WebSocket. No WebRTC, no audio leaves the device. */
-  var audioCtx = null, analyser = null, data = null, prevBins = null, rafId = null, lastSent = 0;
+  var audioCtx = null, analyser = null, data = null, prevBins = null, lastSent = 0;
+  /* §BGFIX (2026-06-18) — the clock that drives the analysis loop is an
+     AudioWorklet on the AUDIO THREAD, which browsers do NOT pause when the tab
+     is backgrounded (unlike requestAnimationFrame, which the old build used and
+     which froze the moment the player switched to Zoom). The worklet posts a
+     metronome tick every ~16ms; the main thread reads the analyser + sends.
+     rafFallbackId = the legacy rAF loop, used only if AudioWorklet is missing. */
+  var workletNode = null, rafFallbackId = null, wakeLock = null, silentGain = null;
   var nameEl   = document.getElementById('name'),
       joinBtn  = document.getElementById('joinBtn'),
       setupEl  = document.getElementById('setup'),
@@ -73,6 +80,14 @@
 
   joinBtn.addEventListener('click', join);
   nameEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') join(); });
+
+  /* §BGFIX — when the tab/screen comes back, resume the context (mobile suspends
+     it on lock) and re-take the wake lock (it's auto-released while hidden). */
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible') return;
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    if (joined) requestWakeLock();
+  });
 
   async function join() {
     if (joined) return;
@@ -105,12 +120,99 @@
       audioCtx.createMediaStreamSource(micStream).connect(analyser);
       data = new Uint8Array(analyser.frequencyBinCount);
     } catch (e) { setStatus('error', 'Audio analysis failed. Reloading may help.'); joinBtn.disabled = false; return; }
+    /* §BGFIX — start the audio-thread metronome (falls back to rAF if needed). */
+    await setupMetronome();
+    requestWakeLock();
     setupEl.style.display = 'none';
     meEl.style.display = 'block';
     lvlWrap.style.display = 'block';
     meName.textContent = name;
     setStatus('connecting', 'Connecting…');
     openSocket(name);
+  }
+
+  /* §BGFIX — AudioWorklet metronome. The processor lives on the audio rendering
+     thread, which keeps calling process() even when the tab is in the
+     background, so the analysis clock never stops. It posts a tick every ~16ms
+     (matched to the old rAF cadence so the flux scale — and the dashboard's
+     sensitivity calibration — is unchanged). We can't open a WebSocket from the
+     worklet, so it only signals; the main-thread handler reads the analyser and
+     sends. Built from a Blob URL to stay a single served file. */
+  var WORKLET_SRC = [
+    'class NMetro extends AudioWorkletProcessor {',
+    '  constructor() { super(); this._acc = 0; }',
+    '  process() {',
+    '    this._acc += 128;',
+    '    if (this._acc >= sampleRate * 0.016) { this._acc = 0; this.port.postMessage(0); }',
+    '    return true;',   /* keep the node alive forever */
+    '  }',
+    '}',
+    'registerProcessor("nmetro", NMetro);'
+  ].join('\n');
+
+  async function setupMetronome() {
+    /* Prefer the audio-thread worklet. If anything goes wrong (older browser,
+       blob/module blocked), fall back to the legacy rAF loop — no worse than
+       the previous build, and foreground still works. */
+    try {
+      if (!audioCtx.audioWorklet) throw new Error('no audioWorklet');
+      var blob = new Blob([WORKLET_SRC], { type: 'application/javascript' });
+      var url  = URL.createObjectURL(blob);
+      await audioCtx.audioWorklet.addModule(url);
+      URL.revokeObjectURL(url);
+      workletNode = new AudioWorkletNode(audioCtx, 'nmetro');
+      workletNode.port.onmessage = onTick;
+      /* Pull the graph all the way to destination so process() keeps running.
+         A zero-gain node = no sound out, no echo. analyser→worklet→gain0→dest. */
+      silentGain = audioCtx.createGain();
+      silentGain.gain.value = 0;
+      analyser.connect(workletNode);
+      workletNode.connect(silentGain).connect(audioCtx.destination);
+    } catch (e) {
+      startRafFallback();
+    }
+  }
+
+  /* Legacy clock — ONLY for browsers without AudioWorklet. Pauses in background
+     tabs (the bug we're fixing), but better than nothing on ancient devices. */
+  function startRafFallback() {
+    if (rafFallbackId) cancelAnimationFrame(rafFallbackId);
+    var loop = function () { rafFallbackId = requestAnimationFrame(loop); onTick(); };
+    loop();
+  }
+
+  /* One analysis step: compute spectral flux (SAME math as before and as the
+     dashboard) and send a throttled mouth level. Driven by the worklet tick
+     (~16ms) or the rAF fallback. */
+  function onTick() {
+    if (!analyser || !joined) return;
+    analyser.getByteFrequencyData(data);
+    var flux = 0;
+    if (prevBins) {
+      for (var i = 0; i < data.length; i++) { var d = data[i] - prevBins[i]; if (d > 0) flux += d; }
+      flux = flux / data.length;
+    } else {
+      prevBins = new Uint8Array(data.length);
+    }
+    prevBins.set(data);
+    /* On-phone test readout — proves THIS device is hearing you, independent of
+       the dashboard. (sensitivity 7 = full bar.) */
+    if (lvlFill) lvlFill.style.width = Math.min(100, (flux / 7) * 100) + '%';
+    if (lvlNum)  lvlNum.textContent  = 'level: ' + (Math.round(flux * 10) / 10);
+    /* Throttle sends to ~25/sec — plenty for discrete mouth flap frames. */
+    var now = performance.now();
+    if (now - lastSent >= 40) { lastSent = now; send({ type: 'mouth', level: Math.round(flux * 10) / 10 }); }
+  }
+
+  /* §BGFIX — keep the screen awake so the page isn't suspended by a display
+     timeout. Best-effort: not on every browser, auto-released when hidden (we
+     re-take it on visibilitychange). Does NOT defeat a manual lock or an app
+     switch — those are OS-level and no web page can override them. */
+  async function requestWakeLock() {
+    try {
+      if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+      wakeLock = await navigator.wakeLock.request('screen');
+    } catch (e) { /* denied / unsupported — fine */ }
   }
 
   function openSocket(name) {
@@ -130,48 +232,26 @@
     if (m.type === 'kicked')  { leave('Removed by the GM.'); return; }
   }
 
-  /* Start (or restart, after a reconnect) the RAF loop that computes spectral
-     flux (the SAME math the dashboard uses) and sends a throttled "mouth level".
-     The analyser graph itself is built in join() so it's tied to the user gesture.
-     The dashboard does all smoothing/sensitivity/flap, so we send the raw
-     per-frame flux — one small number, ~25x/sec. */
+  /* Mark live + ensure the context is running. The clock itself (worklet or rAF
+     fallback) was started once in join(); reconnecting only re-marks status. */
   function startMeter() {
     setStatus('connected', 'Live — your voice is driving your character.');
     if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
     prevBins = null;
     lastSent = 0;
-    if (rafId) cancelAnimationFrame(rafId);
-    tick();
-  }
-
-  function tick() {
-    rafId = requestAnimationFrame(tick);
-    if (!analyser || !joined) return;
-    analyser.getByteFrequencyData(data);
-    var flux = 0;
-    if (prevBins) {
-      for (var i = 0; i < data.length; i++) { var d = data[i] - prevBins[i]; if (d > 0) flux += d; }
-      flux = flux / data.length;
-    } else {
-      prevBins = new Uint8Array(data.length);
-    }
-    prevBins.set(data);
-    /* On-phone test readout — proves THIS device is hearing you, independent of
-       the dashboard. Updated every frame so it's smooth (sensitivity 7 = full bar). */
-    if (lvlFill) lvlFill.style.width = Math.min(100, (flux / 7) * 100) + '%';
-    if (lvlNum)  lvlNum.textContent  = 'level: ' + (Math.round(flux * 10) / 10);
-    /* Throttle to ~25/sec — plenty for discrete mouth flap frames, tiny bandwidth. */
-    var now = performance.now();
-    if (now - lastSent >= 40) { lastSent = now; send({ type: 'mouth', level: Math.round(flux * 10) / 10 }); }
   }
 
   function leave(msg) {
     joined = false;
-    try { if (rafId) cancelAnimationFrame(rafId); } catch (e) {}
+    try { if (rafFallbackId) cancelAnimationFrame(rafFallbackId); } catch (e) {}
+    try { if (workletNode) workletNode.disconnect(); } catch (e) {}
+    try { if (silentGain) silentGain.disconnect(); } catch (e) {}
+    try { if (wakeLock) wakeLock.release(); } catch (e) {}
     try { if (audioCtx) audioCtx.close(); } catch (e) {}
     try { if (ws) ws.close(); } catch (e) {}
     try { if (micStream) micStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-    rafId = null; audioCtx = null; analyser = null; ws = null; micStream = null;
+    rafFallbackId = null; workletNode = null; silentGain = null; wakeLock = null;
+    audioCtx = null; analyser = null; ws = null; micStream = null;
     setStatus('kicked', msg || 'Disconnected.');
     meEl.style.display = 'none';
     lvlWrap.style.display = 'none';
