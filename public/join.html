@@ -57,13 +57,6 @@
   /* Local mic analysis — the pivot: we compute a "mouth level" here and send
      just that number over the WebSocket. No WebRTC, no audio leaves the device. */
   var audioCtx = null, analyser = null, data = null, prevBins = null, lastSent = 0;
-  /* ═══ §VOICE-BAND — ONLY THE SPEECH BINS COUNT ═══════════════════════════════
-     ⛔ SECOND COPY — the dashboard holds the first (search §VOICE-BAND in
-     "Odds and Monsters V667.html"). Change BOTH or remote mouths drift from local ones.
-     ⚠ THE DIVISOR STAYS data.length, NOT the band width — that preserves the legacy
-     numeric scale, so the wire format and the dashboard's tuned constants are untouched. */
-  var VOICE_LO_HZ = 180, VOICE_HI_HZ = 3600;
-  var bandLo = 1, bandHi = 19;   /* 48 kHz values; recomputed from the real sampleRate at join */
   /* §BGFIX (2026-06-18) — the clock that drives the analysis loop is an
      AudioWorklet on the AUDIO THREAD, which browsers do NOT pause when the tab
      is backgrounded (unlike requestAnimationFrame, which the old build used and
@@ -126,11 +119,6 @@
       analyser.smoothingTimeConstant = 0.0;   /* raw frame diffs for spectral flux */
       audioCtx.createMediaStreamSource(micStream).connect(analyser);
       data = new Uint8Array(analyser.frequencyBinCount);
-      /* §VOICE-BAND — derive the bins from THIS device's actual rate. Phones vary
-         (44.1 kHz common; a true 16 kHz context maps to 3..58). Never hardcode. */
-      var binHz = audioCtx.sampleRate / analyser.fftSize;
-      bandLo = Math.max(1, Math.round(VOICE_LO_HZ / binHz));
-      bandHi = Math.min(analyser.frequencyBinCount - 1, Math.round(VOICE_HI_HZ / binHz));
     } catch (e) { setStatus('error', 'Audio analysis failed. Reloading may help.'); joinBtn.disabled = false; return; }
     /* §BGFIX — start the audio-thread metronome (falls back to rAF if needed). */
     await setupMetronome();
@@ -201,7 +189,7 @@
     analyser.getByteFrequencyData(data);
     var flux = 0;
     if (prevBins) {
-      for (var i = bandLo; i <= bandHi; i++) { var d = data[i] - prevBins[i]; if (d > 0) flux += d; }
+      for (var i = 0; i < data.length; i++) { var d = data[i] - prevBins[i]; if (d > 0) flux += d; }
       flux = flux / data.length;
     } else {
       prevBins = new Uint8Array(data.length);
