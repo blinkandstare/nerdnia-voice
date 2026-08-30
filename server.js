@@ -1,10 +1,10 @@
 /* ════════════════════════════════════════════════════════════════
    NERDNIA voice switchboard — Phase 2, Option B (cloud-hosted)
    ----------------------------------------------------------------
-   Relays tiny "mouth level" numbers from each player to the GM dashboard.
-   Each player's browser analyses its OWN mic locally (spectral flux) and
-   sends just a number over this WebSocket; NO audio and NO WebRTC pass
-   through here, so it adds ~0 latency and needs no STUN/TURN. This same
+   Relays one "is this player talking" BOOLEAN from each player to the GM
+   dashboard (§REMOTE-VAD, v2). Each player's browser analyses its OWN mic
+   locally and decides for itself; NO audio and NO WebRTC pass through here,
+   so it adds ~0 latency and needs no STUN/TURN. This same
    process also serves the player join page (public/join.html) over the
    platform's HTTPS, which is required for getUserMedia.
 
@@ -79,9 +79,15 @@ wss.on('connection', (ws) => {
             return;
         }
 
-        /* player -> host mouth level (the pivot: local analysis, just a number) */
+        /* §REMOTE-VAD — player -> host mouth STATE. The phone owns the decision and sends a
+           versioned boolean; this relay validates and forwards, it never interprets audio.
+           ⛔ STRICT v2, NO v1 ADAPTER. It used to rebuild the message as { ..., level: msg.level },
+           which would silently DISCARD v and talking. A cached v1 page now stops here and its mouth
+           closes on the dashboard's stale window — fail-closed beats being misread as speech.
+           ⛔ Never forward the player's object as-is, and never accept string truthiness. */
         if (msg.type === 'mouth' && ws.role === 'player') {
-            send(host, { type: 'mouth', from: ws.connId, level: msg.level });
+            if (msg.v !== 2 || typeof msg.talking !== 'boolean') return;
+            send(host, { type: 'mouth', from: ws.connId, v: 2, talking: msg.talking });
             return;
         }
 
