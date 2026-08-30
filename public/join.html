@@ -104,7 +104,20 @@
     } catch (e) {}
     setStatus('connecting', 'Requesting microphone…');
     try {
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      /* §MIC-CLEAN — ask the browser to strip keyboard/mouse/room noise BEFORE we analyse it.
+         Chrome's voice isolator is trained for exactly this and beats any threshold we apply.
+         ⚠ every key is `ideal`, never `exact` — an unsupported `exact` key makes getUserMedia
+         THROW and the player loses their mic. ⚠ AGC is asked OFF: it flattens the very peaks
+         spectral flux keys on. ⛔ SECOND COPY — the dashboard holds the first (§MIC-CLEAN). */
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          voiceIsolation:   { ideal: true  },
+          noiseSuppression: { ideal: true  },
+          echoCancellation: { ideal: true  },
+          autoGainControl:  { ideal: false }
+        },
+        video: false
+      });
     } catch (e) {
       setStatus('error', 'Microphone blocked. Allow it in the browser and reload.');
       joinBtn.disabled = false;
