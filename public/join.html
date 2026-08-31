@@ -213,6 +213,7 @@
   var RV_HEARTBEAT_MS = 80;    /* ⚠ PAIRED WITH THE DASHBOARD'S 400ms STALE WINDOW — never exceed a
                                   third of it, or one lost packet reads as silence and stutters. */
   var RV_WARMUP_MS    = 600;   /* initial quiet-floor acquisition; cannot open during it */
+  var RV_MAX_TALK_MS  = 15000; /* latched-open guard: nobody talks this long unbroken */
   var RV_FLOOR_MIN    = 1e-5;  /* keeps the ratio finite on a digitally silent input */
 
   /* ⚠ TEMPORARY (§REMOTE-VAD-TUNE). Lets the real-device tuning session try a value with a RELOAD
@@ -241,7 +242,7 @@
   /* Sole initialiser/cleanup writer for detector state. */
   function _rvReset(now) {
     rv.floor = 0; rv.talking = false; rv.aboveMs = 0; rv.belowMs = 0;
-    rv.lastStepAt = now; rv.lastSentAt = 0; rv.warmUntil = now + RV_WARMUP_MS; rv.ratio = 0;
+    rv.lastStepAt = now; rv.lastSentAt = 0; rv.warmUntil = now + RV_WARMUP_MS; rv.ratio = 0; rv.talkStartedAt = 0;
   }
 
   /* Sole WebSocket writer for mouth state. Immediate on a transition, otherwise a heartbeat. */
@@ -267,25 +268,47 @@
     for (var i = 0; i < rvBuf.length; i++) { var s = rvBuf[i]; sum += s * s; }
     var rms = Math.sqrt(sum / rvBuf.length);
 
-    if (rv.floor <= 0) rv.floor = Math.max(rms, RV_FLOOR_MIN);
+    /* ⛔⛔⛔ THE FLOOR MUST NOT BE SEEDED FROM A DEAD FRAME. The mic reads 0 for an instant after
+       join while the AudioContext ramps. Seeding from that pinned the floor at RV_FLOOR_MIN, so
+       every later frame was 200x the floor, `candidate` was permanently true, the freeze-while-
+       candidate rule then blocked every floor update, and the mouth opened once and NEVER closed.
+       Reproduced 2026-08-31 from the GM's "hello hello then flapping for a minute". Two guards:
+       ignore silent frames when seeding, and update UNCONDITIONALLY during warm-up — acquiring the
+       quiet level is the entire point of warm-up, so `candidate` must not veto it there. */
+    if (rv.floor <= 0) {
+        if (rms < RV_FLOOR_MIN * 4) { _rvPublish(now, false); return; }   /* mic not producing yet */
+        rv.floor = rms;
+        rv.warmUntil = now + RV_WARMUP_MS;                                 /* start warm-up HERE */
+    }
     var ratio = rms / Math.max(rv.floor, RV_FLOOR_MIN);
     rv.ratio = ratio;
 
-    /* ⭐ THE FLOOR TRACKS QUIET, NEVER THE FULL RANGE. Frozen while talking and while a candidate
-       is building, so continuous speech can never teach it that speech is the new floor — the
-       defect that made the previous §VOICE-AUTOCAL sag mid-sentence. There is no tracked peak, so
-       one bump cannot poison pickup for tens of seconds either. */
-    var candidate = ratio >= RV_OPEN_RATIO;
-    if (!rv.talking && !candidate) {
-      var a = (rms < rv.floor) ? 0.25 : 0.02;              /* fall fast, rise slowly */
-      rv.floor = Math.max(RV_FLOOR_MIN, rv.floor + a * (rms - rv.floor));
+    if (now < rv.warmUntil) {
+        rv.floor = Math.max(RV_FLOOR_MIN, rv.floor + 0.25 * (rms - rv.floor));   /* unconditional */
+        _rvPublish(now, false);
+        return;
     }
 
-    if (now < rv.warmUntil) { _rvPublish(now, false); return; }   /* acquiring quiet only */
+    /* ⭐ THE FLOOR TRACKS QUIET, NEVER THE FULL RANGE. Frozen while talking and while a candidate
+       is building, so continuous speech cannot teach it that speech is the new floor. */
+    var candidate = ratio >= RV_OPEN_RATIO;
+    if (!rv.talking && !candidate) {
+        var a = (rms < rv.floor) ? 0.25 : 0.02;              /* fall fast, rise slowly */
+        rv.floor = Math.max(RV_FLOOR_MIN, rv.floor + a * (rms - rv.floor));
+    }
+
+    /* ⚠ STUCK-OPEN GUARD. A floor acquired during noise can leave `talking` latched. Nobody speaks
+       for RV_MAX_TALK_MS unbroken, so treat that as a bad floor and re-acquire rather than flap on. */
+    if (rv.talking && (now - rv.talkStartedAt) > RV_MAX_TALK_MS) {
+        rv.talking = false; rv.aboveMs = 0; rv.belowMs = 0;
+        rv.floor = 0; rv.warmUntil = now + RV_WARMUP_MS;
+        _rvPublish(now, true);
+        return;
+    }
 
     if (!rv.talking) {
       if (candidate) { rv.aboveMs += dt; } else { rv.aboveMs = 0; }
-      if (rv.aboveMs >= RV_ATTACK_MS) { rv.talking = true; rv.belowMs = 0; _rvPublish(now, true); return; }
+      if (rv.aboveMs >= RV_ATTACK_MS) { rv.talking = true; rv.belowMs = 0; rv.talkStartedAt = now; _rvPublish(now, true); return; }
     } else {
       if (ratio < RV_CLOSE_RATIO) { rv.belowMs += dt; } else { rv.belowMs = 0; }
       if (rv.belowMs >= RV_RELEASE_MS) { rv.talking = false; rv.aboveMs = 0; _rvPublish(now, true); return; }
